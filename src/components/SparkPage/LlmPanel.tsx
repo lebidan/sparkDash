@@ -12,15 +12,24 @@ import {
 import { BenchmarkDialog } from "./BenchmarkDialog";
 import { PrefillBenchDialog } from "./PrefillBenchDialog";
 import { LlmDailyChart } from "./LlmDailyChart";
+import { LlmTokenTotals } from "./LlmTokenTotals";
+import { ENGINE_GENERATED_LABEL, ENGINE_GENERATED_TITLE } from "./tokenTotalsCopy";
 import { parseLlmTargetInput } from "../../shared/llmTarget.js";
+import { backendLabel } from "../../shared/llmBackends.js";
 import { LlmTrendChart } from "./LlmTrendChart";
+import { engineStateLabel } from "./llmEngineState";
+import { idleLabel, isLlmIdle } from "../../shared/llmIdle";
 
 interface LlmPanelProps {
   llm: LlmMetrics | null;
   sparkId: string;
+  /** Unit display name — lands on the benchmark share card. */
+  sparkName?: string;
   llmPort: number;
   llmPorts?: number[];
   hasApiKey?: boolean;
+  /** Show "Copy image" in the benchmark dialogs (Settings, off by default). */
+  shareImage?: boolean;
   onRemovePort?: (port: number) => void;
   className?: string;
 }
@@ -267,21 +276,13 @@ function LlmLaunchers({
 
 /** Backend badge — neutral surfaces with a single accent dot. No blue/purple. */
 function BackendBadge({ backend }: { backend: string | null }) {
-  if (!backend) return <span className="text-xs text-muted">No backend</span>;
-
-  const labels: Record<string, string> = {
-    vllm: "vLLM",
-    "llama.cpp": "llama.cpp",
-    sglang: "sgLang",
-    ds4: "ds4",
-    exl3: "EXL3",
-    q27: "q27",
-  };
+  const label = backendLabel(backend);
+  if (!label) return <span className="text-xs text-muted">No backend</span>;
 
   return (
     <span className="llm-badge">
       <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-      {labels[backend] || backend}
+      {label}
     </span>
   );
 }
@@ -379,9 +380,11 @@ function MetricInfoTip({
 export function LlmPanel({
   llm,
   sparkId,
+  sparkName,
   llmPort,
   llmPorts,
   hasApiKey = false,
+  shareImage = false,
   onRemovePort,
   className,
 }: LlmPanelProps) {
@@ -448,6 +451,10 @@ export function LlmPanel({
   const cachedPrefillTps = llm?.cachedPrefillTps ?? 0;
   const uncachedPrefillTps = llm?.uncachedPrefillTps ?? 0;
   const available = llm?.available ?? false;
+  // While nothing is flowing, say when the endpoint last served.
+  const idleNote = available && isLlmIdle({ generationTps, prefillTps })
+    ? idleLabel(llm?.lastActiveAt)
+    : null;
 
   // Keep draft in sync when server pushes a different port (other tab / reload)
   useEffect(() => {
@@ -672,6 +679,7 @@ export function LlmPanel({
             onRemotePrefill={openRemotePrefill}
           />
           <LlmDailyChart sparkId={sparkId} llmPort={llmPort} />
+          <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
       ) : (
         <div className="space-y-3">
@@ -697,7 +705,14 @@ export function LlmPanel({
           )}
 
           <div className="flex items-center justify-between">
-            <span className="text-xs text-muted">Generation tok/s</span>
+            <div className="flex min-w-0 flex-col">
+              <span className="text-xs text-muted">Generation tok/s</span>
+              {idleNote && (
+                <span className="text-[10px] text-muted opacity-80" data-llm-idle>
+                  {idleNote}
+                </span>
+              )}
+            </div>
             <div className="flex items-center gap-2">
               <Sparkline data={genHistory} color="var(--color-accent)" height={24} />
               <div className="text-right">
@@ -714,7 +729,7 @@ export function LlmPanel({
           </div>
           <div
             className="flex items-center justify-between"
-            title="Tokens/sec while the engine is reading the prompt and building KV cache — before the first output token. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Prefix-cache hits do little compute, so this can stay ~0. Long cold prefills show here until decode starts."
+            title="Prompt tokens/sec taken in during the last poll window — cache-served + computed; the rows below split that total into the two parts. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Cached prefill does little GPU work; uncached prefill is what builds KV cache."
           >
             <span className="text-xs text-muted">Prefill tok/s</span>
             <div className="flex items-center gap-2">
@@ -835,17 +850,26 @@ export function LlmPanel({
                   )}
                 </button>
               </div>
-              <div className="font-tabular text-sm text-text">
-                {llm?.gpuMemoryUtilization != null
-                  ? llm.gpuMemoryUtilization === 0
-                    ? "Sleeping"
-                    : "Active"
-                  : "—"}
-              </div>
+              {(() => {
+                const engine = engineStateLabel(llm);
+                return (
+                  <div
+                    className={`font-tabular text-sm ${engine.muted ? "text-muted" : "text-text"}`}
+                    title={engine.title}
+                  >
+                    {engine.text}
+                  </div>
+                );
+              })()}
             </div>
             <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-muted">Total Generated</div>
-              <div className="font-tabular text-sm text-text">
+              <div
+                className="text-[10px] uppercase tracking-wide text-muted"
+                title={ENGINE_GENERATED_TITLE}
+              >
+                {ENGINE_GENERATED_LABEL}
+              </div>
+              <div className="font-tabular text-sm text-text" title={ENGINE_GENERATED_TITLE}>
                 {llm && llm.totalOutputTokens > 0
                   ? llm.totalOutputTokens.toLocaleString()
                   : "—"}
@@ -996,6 +1020,7 @@ export function LlmPanel({
             onRemoteDecode={openRemoteDecode}
             onRemotePrefill={openRemotePrefill}
           />
+          <LlmTokenTotals sparkId={sparkId} llmPort={llmPort} />
         </div>
       )}
 
@@ -1006,6 +1031,10 @@ export function LlmPanel({
         llmPort={llmPort}
         modelId={remoteTarget ? null : llm?.modelId ?? null}
         remoteTarget={remoteTarget}
+        shareImage={shareImage}
+        sparkName={sparkName ?? null}
+        engine={remoteTarget ? null : llm?.backend ?? null}
+        posture={remoteTarget ? null : llm?.posture ?? null}
       />
       <PrefillBenchDialog
         open={prefillBenchOpen}
@@ -1015,6 +1044,10 @@ export function LlmPanel({
         modelId={remoteTarget ? null : llm?.modelId ?? null}
         contextLength={remoteTarget ? null : llm?.contextLength ?? null}
         remoteTarget={remoteTarget}
+        shareImage={shareImage}
+        sparkName={sparkName ?? null}
+        engine={remoteTarget ? null : llm?.backend ?? null}
+        posture={remoteTarget ? null : llm?.posture ?? null}
       />
     </Panel>
   );

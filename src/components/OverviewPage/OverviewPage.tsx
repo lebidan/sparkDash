@@ -1,12 +1,22 @@
 import { useEffect, useState } from "react";
-import type { SparkSnapshot } from "../../api/types";
+import type { LlmMetrics, SparkSnapshot } from "../../api/types";
 import { isWorkerSpark, resolveSparkRole } from "../../api/sparkRole";
+import { idleLabel, isLlmIdle } from "../../shared/llmIdle";
 import { shutdownAllSparks, updateAllHermes, wakeAllSparks } from "../../api/client";
 import { ConfirmShutdownDialog } from "../ConfirmShutdownDialog";
 import { MetricBar } from "../ui/MetricBar";
+import { VramBreakdownBar } from "../ui/VramBreakdownBar";
 import { FleetEnergyCard } from "./FleetEnergyCard";
 import { FleetAlertStrip } from "./FleetAlertStrip";
+import { FleetTokenTotals } from "./FleetTokenTotals";
 import { ActivityIcon, PowerOffIcon, PowerOnIcon, RotateIcon } from "../ui/icons";
+import { formatDiskSize, formatMb } from "../../shared/formatBytes";
+import {
+  computeVramBreakdown,
+  headroomMiniStatTone,
+  vramContextFor,
+  type VramBreakdownContext,
+} from "../../shared/vramBreakdown";
 
 interface OverviewPageProps {
   sparks: SparkSnapshot[];
@@ -15,6 +25,10 @@ interface OverviewPageProps {
   showFleetEnergy?: boolean;
   showFleetExceptions?: boolean;
   showOverviewSearch?: boolean;
+  /** Overview LLM token totals card (cumulative tokens per model). */
+  showLlmTokenTotals?: boolean;
+  /** VRAM bar split by engine / system / free, judged by headroom. On by default. */
+  showVramBreakdown?: boolean;
   temperatureUnit?: "celsius" | "fahrenheit";
   onSelectSpark?: (id: string) => void;
 }
@@ -23,10 +37,7 @@ function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
 }
 
-function formatMb(mb: number): string {
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
-  return `${Math.round(mb)} MB`;
-}
+
 
 /** Format a storage value in MB, stripping trailing ".0" and optionally omitting the unit. */
 function fmtStorage(mb: number, unit: boolean): string {
@@ -79,14 +90,57 @@ function MiniStat({
   );
 }
 
+/**
+ * Live decode / prefill rates under an LLM card. While both are zero the two
+ * big "0"s carry no information, so they give way to one muted line saying
+ * when the endpoint last served. The rate row stays in the layout (hidden) so
+ * the card keeps the same height either way.
+ */
+function LlmRateFooter({ llm }: { llm: LlmMetrics }) {
+  const idle = isLlmIdle(llm);
+  return (
+    <div className="relative mt-3.5 border-t border-border pt-3">
+      <div
+        className={`grid grid-cols-2 gap-2 ${idle ? "invisible" : ""}`}
+        aria-hidden={idle || undefined}
+        data-llm-rates
+      >
+        <div className="text-center">
+          <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
+            {llm.generationTps.toFixed(0)}
+          </span>
+          <span className="text-sm font-normal text-muted"> tok/s</span>
+        </div>
+        <div className="border-l border-border text-center">
+          <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
+            {llm.prefillTps.toFixed(0)}
+          </span>
+          <span className="text-sm font-normal text-muted"> prefill</span>
+        </div>
+      </div>
+      {idle && (
+        <div
+          className="absolute inset-x-0 bottom-0 top-3 flex items-center justify-center text-[13px] text-muted"
+          data-llm-idle
+        >
+          {idleLabel(llm.lastActiveAt)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SparkCard({
   spark,
   headSparkName,
+  vramContext = null,
   temperatureUnit,
   onSelect,
 }: {
   spark: SparkSnapshot;
   headSparkName?: string | null;
+  /** Breakdown inputs (see `vramContextFor`); null keeps the plain VRAM bar. */
+  vramContext?: VramBreakdownContext | null;
   temperatureUnit: "celsius" | "fahrenheit";
   onSelect?: (id: string) => void;
 }) {
@@ -110,6 +164,8 @@ function SparkCard({
   const usageBarColor = usage > 85 ? "bg-danger" : usage > 60 ? "bg-warning" : "bg-accent";
   // VRAM allocation: accent normal → warning/danger as it fills
   const vramBarColor = vramPct > 85 ? "bg-danger" : vramPct > 60 ? "bg-warning" : "bg-accent";
+  const breakdown =
+    gpu && vramContext ? computeVramBreakdown(gpu.vram, gpu.processes, vramContext) : null;
 
   return (
     <div
@@ -206,15 +262,22 @@ function SparkCard({
         </div>
       ) : (
         <>
-          {/* Three headline bars: GPU alloc, Temp, Usage */}
+          {/* Headline bars: VRAM, (RAM), GPU temp, (CPU temp), GPU util */}
           <div className="flex flex-col gap-3.5">
-            <MetricBar
-              label="VRAM"
-              value={vramUsed}
-              max={vramTotal}
-              color={vramBarColor}
-              caption={vramTotal > 0 ? `${fmtStorage(vramUsed, false)} / ${fmtStorage(vramTotal, true)}` : "—"}
-            />
+            {breakdown ? (
+              <VramBreakdownBar
+                label={breakdown.systemMB != null ? "Unified memory" : "VRAM"}
+                breakdown={breakdown}
+              />
+            ) : (
+              <MetricBar
+                label="VRAM"
+                value={vramUsed}
+                max={vramTotal}
+                color={vramBarColor}
+                caption={vramTotal > 0 ? `${fmtStorage(vramUsed, false)} / ${fmtStorage(vramTotal, true)}` : "—"}
+              />
+            )}
             {spark.kind === "host" && (() => {
               // Non-Spark hosts: system RAM is separate from discrete VRAM.
               const ram = spark.metrics.ram;
@@ -233,11 +296,7 @@ function SparkCard({
               );
             })()}
             <MetricBar
-              label={
-                spark.kind === "host" || (spark.metrics.cpu?.temperature ?? 0) > 0
-                  ? "GPU"
-                  : "Temperature"
-              }
+              label="GPU temp"
               value={displayTemp}
               max={temperatureUnit === "fahrenheit" ? 212 : 100}
               color={tempBarColor}
@@ -253,7 +312,7 @@ function SparkCard({
                 cpuRaw > 95 ? "bg-danger" : cpuRaw > 85 ? "bg-warning" : cpuRaw > 50 ? "bg-accent" : "bg-success";
               return (
                 <MetricBar
-                  label="CPU"
+                  label="CPU temp"
                   value={cpuDisplay}
                   max={temperatureUnit === "fahrenheit" ? 212 : 100}
                   color={cpuBarColor}
@@ -270,7 +329,7 @@ function SparkCard({
               </div>
             )}
             <MetricBar
-              label="Usage"
+              label="GPU util"
               value={usage}
               max={100}
               color={usageBarColor}
@@ -284,12 +343,20 @@ function SparkCard({
               label="GPU Power"
               value={`${gpu?.power?.draw ?? 0}W / ${gpu?.power?.limit ?? 0}W`}
             />
-            {vramAvail > 0 && (
+            {breakdown ? (
               <MiniStat
                 label="Available"
-                value={formatMb(vramAvail)}
-                tone={vramAvail < 4096 ? "danger" : vramAvail < 16384 ? "warning" : "accent"}
+                value={formatMb(breakdown.freeMB)}
+                tone={headroomMiniStatTone(breakdown.tone)}
               />
+            ) : (
+              vramAvail > 0 && (
+                <MiniStat
+                  label="Available"
+                  value={formatMb(vramAvail)}
+                  tone={vramAvail < 4096 ? "danger" : vramAvail < 16384 ? "warning" : "accent"}
+                />
+              )
             )}
             {(() => {
               // Find the root disk by label "/" (the collector maps the host
@@ -302,7 +369,8 @@ function SparkCard({
                 return (
                   <MiniStat
                     label="Storage"
-                    value={`${fmtStorage(rootDisk.used, false)} / ${fmtStorage(rootDisk.total, true)}`}
+                    value={`${formatDiskSize(rootDisk.used)} / ${formatDiskSize(rootDisk.total)}`}
+                    title={`${fmtStorage(rootDisk.used, true)} of ${fmtStorage(rootDisk.total, true)} used (${Math.round(rootDisk.percentage)}%)`}
                     tone={rootDisk.percentage > 85 ? "danger" : rootDisk.percentage > 60 ? "warning" : "default"}
                     bold={false}
                   />
@@ -346,12 +414,14 @@ function SparkCard({
                       : llm.backend === "ds4"
                         ? "ds4"
                         : llm.backend === "sglang"
-                          ? "sgLang"
+                          ? "SGLang"
                           : llm.backend === "exl3"
                             ? "EXL3"
                             : llm.backend === "q27"
                               ? "q27"
-                              : llm.backend ?? "LLM"
+                              : llm.backend === "tensorfold"
+                                ? "TensorFold"
+                                : llm.backend ?? "LLM"
                   }
                   value={llm.modelId ?? "unknown"}
                   tone="accent"
@@ -368,22 +438,7 @@ function SparkCard({
             const llmArr = spark.metrics.llm;
             const llm = Array.isArray(llmArr) ? llmArr.find((l) => l.available) : null;
             if (!llm) return null;
-            return (
-              <div className="mt-3.5 grid grid-cols-2 gap-2 border-t border-border pt-3">
-                <div className="text-center">
-                  <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
-                    {llm.generationTps.toFixed(0)}
-                  </span>
-                  <span className="text-sm font-normal text-muted"> tok/s</span>
-                </div>
-                <div className="border-l border-border text-center">
-                  <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
-                    {llm.prefillTps.toFixed(0)}
-                  </span>
-                  <span className="text-sm font-normal text-muted"> prefill</span>
-                </div>
-              </div>
-            );
+            return <LlmRateFooter llm={llm} />;
           })()}
         </>
       )}
@@ -398,6 +453,8 @@ export function OverviewPage({
   showFleetEnergy = false,
   showFleetExceptions = false,
   showOverviewSearch = false,
+  showLlmTokenTotals = false,
+  showVramBreakdown = true,
   temperatureUnit = "celsius",
   onSelectSpark,
 }: OverviewPageProps) {
@@ -700,6 +757,7 @@ export function OverviewPage({
         description={`Gracefully shut down all ${onlineShutdownCount} online Spark${onlineShutdownCount === 1 ? "" : "s"}? Offline nodes will be skipped.`}
         confirmLabel="Shut down all"
       />
+      {showLlmTokenTotals ? <FleetTokenTotals /> : null}
       <div className="overview-page grid sm:grid-cols-2 lg:grid-cols-3" style={{ gap: "var(--density-page-gap)" }}>
         {visibleSparks.length === 0 && (
           <p className="panel p-6 text-sm text-muted sm:col-span-2 lg:col-span-3">
@@ -715,6 +773,7 @@ export function OverviewPage({
                 ? sparks.find((s) => s.id === spark.workerHeadId)?.name ?? null
                 : null
             }
+            vramContext={showVramBreakdown ? vramContextFor(spark, sparks) : null}
             temperatureUnit={temperatureUnit}
             onSelect={onSelectSpark}
           />
