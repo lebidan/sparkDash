@@ -99,7 +99,8 @@ function SparkCardImpl({
   const memUsed = gpu?.vram?.used ?? um?.used ?? 0;
   const memTotal = gpu?.vram?.total ?? um?.total ?? 0;
   const memAvail = gpu?.vram?.available ?? um?.available ?? 0;
-  const breakdown = gpu && vramContext ? computeVramBreakdown(gpu.vram, gpu.processes, vramContext) : null;
+  const vramAvailable = gpu?.metricAvailability?.vramUsed !== false && gpu?.metricAvailability?.vramTotal !== false;
+  const breakdown = gpu && vramAvailable && vramContext ? computeVramBreakdown(gpu.vram, gpu.processes, vramContext) : null;
   const throttle = gpu?.throttle;
   const slowed = !!(throttle?.thermal || throttle?.hwSlowdown);
   const hot = slowed || tempRaw >= 80;
@@ -172,13 +173,21 @@ function SparkCardImpl({
   const showLauncher = role !== "worker" && !llm && spark.llmMonitoring !== false && spark.platform !== "windows";
 
   const showTps = role !== "worker" && !!llm;
+  const isStrata = llm?.backend === "strata";
+  // Engines that report requests (TensorFold, Strata, …) used to hide their parallelism behind
+  // "N running": a unit set to --parallel 4 and one set to 8 read the same. Name the capacity too.
+  const parallel = llm && llm.slotsTotal > 0 ? llm.slotsTotal : null;
   const llmChip = llm
     ? llm.requestsRunning != null
-      ? `${llm.requestsRunning} running · ${llm.requestsWaiting ?? 0} queued`
+      ? `${llm.requestsRunning} running · ${llm.requestsWaiting == null ? "queue unknown" : `${llm.requestsWaiting} queued`}${
+          parallel != null ? ` · ${parallel} slots` : ""
+        }`
       : llm.slotsTotal > 0
-        ? `${llm.slotsActive}/${llm.slotsTotal} slots`
+        ? `${llm.slotsActive ?? "?"}/${llm.slotsTotal} slots`
         : null
     : null;
+  const llmChipTitle =
+    parallel != null && llm?.requestsRunning != null ? `${parallel} requests decode in parallel on this engine` : undefined;
 
   const chips = (
     <div className="ov-chips">
@@ -188,7 +197,12 @@ function SparkCardImpl({
           {throttle.smClockMHz ? ` · SM ${(throttle.smClockMHz / 1000).toFixed(1)} GHz` : ""}
         </Tag>
       ) : null}
-      {online && llmChip ? <Tag tone={(llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0 ? "good" : "neutral"}>{llmChip}</Tag> : null}
+      {online && throttle?.clockCapMHz != null ? (
+        <Tag title="GPU clock locked with nvidia-smi -lgc">
+          Cap {(throttle.clockCapMHz / 1000).toFixed(1)} GHz
+        </Tag>
+      ) : null}
+      {online && llmChip ? <Tag tone={(llm?.requestsRunning ?? llm?.slotsActive ?? 0) > 0 ? "good" : "neutral"} title={llmChipTitle}>{llmChip}</Tag> : null}
       {comfy !== undefined || spark.comfyMonitoring ? (
         !comfy?.available ? (
           <Tag title="ComfyUI monitoring on — not reachable">Comfy</Tag>
@@ -263,13 +277,13 @@ function SparkCardImpl({
               ) : (
                 <Bar
                   label={gpu.vram?.total ? "VRAM" : "Unified memory"}
-                  caption={memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
-                  pct={memPct}
+                  caption={vramAvailable && memTotal > 0 ? `${fmtStorage(memUsed, false)} / ${fmtStorage(memTotal, true)}` : "—"}
+                  pct={vramAvailable ? memPct : 0}
                   color={memColor}
                   sub={memTotal > 0 && memAvail > 0 ? { label: "Available", value: formatMb(memAvail) } : null}
                 />
               )}
-              <Bar label="GPU" caption={`${Math.round(usage)}%`} pct={usage} color={ringColor} />
+              <Bar label="GPU" caption={gpu.metricAvailability?.usage === false ? "—" : `${Math.round(usage)}%`} pct={gpu.metricAvailability?.usage === false ? 0 : usage} color={ringColor} />
               {spark.kind === "host" && spark.metrics.ram?.total ? (
                 <Bar
                   label="RAM"
@@ -278,11 +292,11 @@ function SparkCardImpl({
                   color="var(--color-info)"
                 />
               ) : null}
-              <Bar label="GPU temp" caption={fmtTemp(tempRaw)} pct={(tempVal / tempMax) * 100} color={tempColor} />
+              <Bar label="GPU temp" caption={gpu.metricAvailability?.temperature === false ? "—" : fmtTemp(tempRaw)} pct={gpu.metricAvailability?.temperature === false ? 0 : (tempVal / tempMax) * 100} color={tempColor} />
               <Bar
                 label="GPU power"
-                caption={`${power?.draw ?? 0} / ${power?.limit ?? 0} W`}
-                pct={powerPct}
+                caption={gpu.metricAvailability?.powerDraw === false ? "—" : `${power?.draw ?? 0} / ${gpu.metricAvailability?.powerLimit === false ? "—" : power?.limit ?? 0} W`}
+                pct={gpu.metricAvailability?.powerDraw === false ? 0 : powerPct}
                 color="var(--color-violet)"
               />
             </div>
@@ -317,20 +331,41 @@ function SparkCardImpl({
           ) : null}
           {showTps && llm ? (
             <div className="ov-tps">
-              <div>
+              <div
+                title={
+                  isStrata
+                    ? "Live sliding-window decode rate. When that window is unavailable, the active-slot mean sums each active slot’s generated tokens divided by its elapsed time since first token; it excludes prefill time."
+                    : undefined
+                }
+              >
                 <div className="eyebrow">Decode</div>
-                <div className="big-num ov-tps__num">{llm.generationTps.toFixed(1)}<small>tok/s</small></div>
+                {isStrata && llm.decodeActive && llm.generationTps <= 0 ? (
+                  <div className="big-num ov-tps__num ov-tps__num--live">
+                    <span className="ov-tps__dots" aria-hidden />
+                    <small>decoding</small>
+                  </div>
+                ) : (
+                  <div className="big-num ov-tps__num">{llm.generationTps.toFixed(1)}<small>tok/s</small></div>
+                )}
+                {isStrata && llm.generationTpsSource === "slot-mean" && <small className="text-muted">active-slot mean</small>}
               </div>
-              <div>
+              <div
+                title={
+                  isStrata
+                    ? "Engine-reported mean for computed/new prompt tokens. It may be from an earlier prefill and is not an aggregate across slots."
+                    : undefined
+                }
+              >
                 <div className="eyebrow">Prefill</div>
                 {llm.prefillActive && llm.prefillTps <= 0 ? (
-                  <div className="big-num ov-tps__num ov-tps__num--live" title="A prompt is being processed. The engine reports its speed only when the request finishes.">
+                  <div className="big-num ov-tps__num ov-tps__num--live" title={isStrata ? "A prompt is being processed; no current prefill rate is available." : "A prompt is being processed. The engine reports its speed only when the request finishes."}>
                     <span className="ov-tps__dots" aria-hidden />
                     <small>prefilling</small>
                   </div>
                 ) : (
                   <div className="big-num ov-tps__num">{Math.round(llm.prefillTps).toLocaleString()}<small>tok/s</small></div>
                 )}
+                {isStrata && llm.prefillTps > 0 && <small className="text-muted">last reported mean</small>}
               </div>
             </div>
           ) : null}
@@ -363,6 +398,15 @@ function SparkCardImpl({
               <code>{"\u00a0"}</code>
             </div>
           )}
+          {online && role !== "worker" && [...new Set([
+            ...llmList.filter((entry) => entry.available).flatMap((entry) => entry.models?.length ? entry.models : entry.modelId ? [entry.modelId] : []),
+            ...(spark.metrics.residentModels ?? []).map((entry) => entry.modelId),
+          ])].filter((name) => name !== modelText).map((name) => (
+            <div className="ov-modelrow" key={name} title={`${name} · loaded model; throughput shown for the monitored endpoint above`}>
+              <code>{name}</code>
+              <span className="ov-modelrow__ctx">Loaded</span>
+            </div>
+          ))}
         </>
       )}
 

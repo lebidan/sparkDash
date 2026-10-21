@@ -40,6 +40,37 @@ test("prometheusExport is opt-in and stored as a boolean", () => {
   assert.equal(updateSettings({ prometheusExport: 0 }).prometheusExport, false);
 });
 
+test("vulnhuntEnabled is opt-in and stored as a boolean", () => {
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  assert.equal(loadSettings().vulnhuntEnabled, false);
+  assert.equal(updateSettings({ vulnhuntEnabled: "yes" }).vulnhuntEnabled, true);
+  assert.equal(loadSettings().vulnhuntEnabled, true);
+  assert.equal(updateSettings({ vulnhuntEnabled: 0 }).vulnhuntEnabled, false);
+});
+
+test("reaEnabled is opt-in and stored as a boolean", () => {
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  assert.equal(loadSettings().reaEnabled, false);
+  assert.equal(updateSettings({ reaEnabled: "yes" }).reaEnabled, true);
+  assert.equal(updateSettings({ reaEnabled: 0 }).reaEnabled, false);
+});
+
+test("metricsHistory is opt-in and stored as a boolean", () => {
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  assert.equal(loadSettings().metricsHistory, false);
+  assert.equal(updateSettings({ metricsHistory: 1 }).metricsHistory, true);
+  assert.equal(loadSettings().metricsHistory, true);
+  assert.equal(updateSettings({ metricsHistory: "" }).metricsHistory, false);
+});
+
+test("alertsEnabled is opt-in and stored as a boolean", () => {
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  assert.equal(loadSettings().alertsEnabled, false);
+  assert.equal(updateSettings({ alertsEnabled: "yes" }).alertsEnabled, true);
+  assert.equal(loadSettings().alertsEnabled, true);
+  assert.equal(updateSettings({ alertsEnabled: 0 }).alertsEnabled, false);
+});
+
 test("timeZone follows the browser by default, accepts IANA names and drops anything else", () => {
   fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
   assert.equal(loadSettings().timeZone, "");
@@ -49,4 +80,22 @@ test("timeZone follows the browser by default, accepts IANA names and drops anyt
   assert.equal(updateSettings({ timeZone: 5 }).timeZone, "");
   assert.equal(updateSettings({ timeZone: "x".repeat(80) }).timeZone, "");
   assert.equal(updateSettings({ timeZone: "" }).timeZone, "");
+});
+
+test("every Overview panel is shown by default (an older file gets that too) and each can be switched off", () => {
+  const keys = ["showFleetEnergy", "showLlmTokenTotals", "showActivityFeed", "showKpiDecode", "showKpiPower", "showKpiMemory", "showKpiTokens"];
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  const fresh = loadSettings();
+  for (const k of keys) assert.equal(fresh[k], true, k);
+  for (const k of keys) {
+    assert.equal(updateSettings({ [k]: false })[k], false, k);
+    assert.equal(updateSettings({ [k]: true })[k], true, k);
+  }
+});
+
+test("intelVramSudo is opt-in and stored as a boolean", () => {
+  fs.writeFileSync(process.env.SETTINGS_JSON_PATH, JSON.stringify({ density: "compact" }));
+  assert.equal(loadSettings().intelVramSudo, false);
+  assert.equal(updateSettings({ intelVramSudo: "yes" }).intelVramSudo, true);
+  assert.equal(updateSettings({ intelVramSudo: 0 }).intelVramSudo, false);
 });

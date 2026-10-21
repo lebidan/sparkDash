@@ -8,7 +8,6 @@ import dotenv from "dotenv";
 import { SparkRegistry } from "./sparks/SparkRegistry.js";
 import { resolveFrontendDir, FRONTEND_MISSING_MESSAGE } from "./frontendDir.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
-import { collectionWasSuccessful } from "./collectors/SystemCollector.js";
 import { sshExec } from "./collectors/ssh.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
 import {
@@ -24,6 +23,8 @@ import { inspectHealth } from "./health.js";
 import { getSettings, updateSettings, loadSettings } from "./settings.js";
 import { broadcastForLanIp, effectiveMac, normalizeMac, sendWol } from "./wol.js";
 import { remoteShutdownCommand, spawnLocalShutdown } from "./shutdown.js";
+import { GpuClockManager } from "./gpuclock/GpuClockManager.js";
+import { registerGpuClockRoutes } from "./gpuclock/routes.js";
 import {
   decodeBenchManager,
   DECODE_BENCH_DEFAULTS,
@@ -40,6 +41,7 @@ import {
   normalizeQualityOptions,
 } from "./collectors/QualityBench.js";
 import { showcaseManager } from "./collectors/ShowcaseManager.js";
+import { InferenceActivityStore } from "./collectors/InferenceActivity.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
 import { onceClose, resolveLlmHttpTarget } from "./collectors/llmTunnel.js";
 import { formatLlmBaseUrl, parseLlmTargetInput } from "../src/shared/llmTarget.js";
@@ -51,15 +53,25 @@ import {
 } from "./llmtokens/LlmTokenRuntime.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
-import { FLEET_ENERGY_JSON_PATH, FLEET_ENERGY_MONTHLY_JSON_PATH } from "./config.js";
+import { createModelPricesHandler } from "./prices/ModelPrices.js";
+import { ALERTS_JSON_PATH, FLEET_ENERGY_JSON_PATH, FLEET_ENERGY_MONTHLY_JSON_PATH, MAX_ACTIVE_BENCH_JOBS, METRICS_HISTORY_JSON_PATH } from "./config.js";
+import { createAlertsRuntime, registerAlertRoutes } from "./alerts/runtime.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
 import { EventLog } from "./events/EventLog.js";
-import { GpuHistory, deviceReadings } from "./metrics/GpuHistory.js";
+import { UnitHistory } from "./metrics/UnitHistory.js";
+import { createUnitHistoryRuntime, registerUnitHistoryRoutes } from "./metrics/UnitHistoryRuntime.js";
 import { LauncherStore } from "./llmlaunch/LauncherStore.js";
 import { LauncherManager } from "./llmlaunch/LauncherManager.js";
 import { ToolEvalStore } from "./tooleval/ToolEvalStore.js";
 import { ToolEvalManager } from "./tooleval/ToolEvalManager.js";
 import { registerToolEvalRoutes } from "./tooleval/routes.js";
+import { VulnHuntStore } from "./vulnhunt/VulnHuntStore.js";
+import { VulnHuntManager } from "./vulnhunt/VulnHuntManager.js";
+import { registerVulnHuntRoutes } from "./vulnhunt/routes.js";
+import { ReaStore } from "./rea/ReaStore.js";
+import { ReaManager } from "./rea/ReaManager.js";
+import { registerReaRoutes } from "./rea/routes.js";
+import { registerReaUploadRoutes } from "./rea/uploads.js";
 import { benchEvent } from "./events/eventFormat.js";
 import {
   createFleetEnergyRuntime,
@@ -245,7 +257,6 @@ const allowBench = createRateLimiter(20, 60_000);
 const allowGlobalDestructive = createRateLimiter(30, 60_000);
 /** Anti double-submit only; per-Spark mutex + MAX_ACTIVE_BENCH_JOBS cap load. */
 const benchCooldown = createRateLimiter(1, 3_000);
-const MAX_ACTIVE_BENCH_JOBS = 2;
 
 /** Running decode + prefill + quality jobs across all Sparks. */
 function activeBenchJobCount() {
@@ -262,7 +273,7 @@ function consumeBenchStartQuota(req, res) {
   // target resolution, so two concurrent requests could both have passed. This
   // runs synchronously right before the manager's start(), closing that window.
   if (activeBenchJobCount() >= MAX_ACTIVE_BENCH_JOBS) {
-    res.status(429).json({ error: "Global active benchmark cap reached; wait for a job to finish" });
+    res.status(429).json({ error: `Global active benchmark cap (${MAX_ACTIVE_BENCH_JOBS}) reached; wait for a job to finish` });
     return false;
   }
   const key = principalKey(req);
@@ -287,6 +298,7 @@ function consumeBenchStartQuota(req, res) {
 
 // ─── Spark registry ──────────────────────────────────────
 const registry = new SparkRegistry();
+const inferenceActivity = new InferenceActivityStore();
 
 const fleetEnergyTracker = new FleetEnergyTracker({
   nodeIds: registry.sparkIds,
@@ -301,29 +313,18 @@ const eventLog = new EventLog({
   max: 2000,
 });
 
-// ─── GPU history (so a fresh page can draw the last hours at once) ─────
-const gpuHistory = new GpuHistory({
+// ─── Unit history (so a fresh page can draw the last hours at once) ─────
+// GPU: a dense ~2 s series for 8 h (Overview/Spark charts) and a minute-resolution series for
+// a week (Temps day/week), always on, in one store fed by one sampler. The 48 h / 30 d bucketed
+// tiers only with Settings → metricsHistory on (read every tick, so no restart); the sampler is
+// started once the monitors exist, below.
+const metricsHistoryEnabled = () => getSettings().metricsHistory === true;
+const unitHistory = new UnitHistory({
   file: process.env.GPU_HISTORY_JSON_PATH || path.join(ROOT, "config", "gpu-history.json"),
+  longFile: process.env.GPU_HISTORY_LONG_JSON_PATH || path.join(ROOT, "config", "gpu-history-long.json"),
+  tiersFile: METRICS_HISTORY_JSON_PATH,
+  tiersEnabled: metricsHistoryEnabled,
 });
-const GPU_HISTORY_SAMPLE_MS = 2000;
-function sampleGpuHistory() {
-  try {
-    for (const snap of orderedSnapshots()) {
-      const gpu = snap?.metrics?.gpu;
-      // Require a real collection: a default/failed GPU result would record a fabricated 0 C / 0 %.
-      if (!snap?.online || !gpu || !collectionWasSuccessful(gpu)) continue;
-      const draw = gpu.power?.draw;
-      const limit = gpu.power?.limit;
-      const powerPct = Number.isFinite(draw) && Number.isFinite(limit) && limit > 0 ? Math.min(100, (draw / limit) * 100) : null;
-      gpuHistory.record(snap.id, Date.now(), gpu.usage, gpu.temperature, powerPct, deviceReadings(gpu.gpus));
-    }
-  } catch {
-    /* sampling must never break the server */
-  }
-}
-const gpuHistoryTimer = setInterval(sampleGpuHistory, GPU_HISTORY_SAMPLE_MS);
-gpuHistoryTimer.unref?.();
-gpuHistory.start();
 
 /** Record an event; never throws (callers sit in poll loops and routes). */
 function recordEvent(event) {
@@ -397,6 +398,39 @@ const toolEvalManager = new ToolEvalManager({
 });
 const allowToolEval = createRateLimiter(30, 60_000);
 
+// ─── VulnHunter scans (vh + an agent harness on a unit) ──
+const vulnHuntStore = new VulnHuntStore({
+  file: process.env.VULNHUNT_RUNS_PATH || path.join(ROOT, "config", "vulnhunt-runs.json"),
+  resultsDir: process.env.VULNHUNT_RESULTS_DIR || path.join(ROOT, "config", "vulnhunt-results"),
+});
+const vulnHuntManager = new VulnHuntManager({
+  store: vulnHuntStore,
+  onEvent: (event) => recordEvent(event),
+});
+const allowVulnHunt = createRateLimiter(30, 60_000);
+
+// ─── REA (Tools): reverse engineering on a unit ──
+const reaStore = new ReaStore({
+  file: process.env.REA_RUNS_PATH || path.join(ROOT, "config", "rea-runs.json"),
+  resultsDir: process.env.REA_RESULTS_DIR || path.join(ROOT, "config", "rea-results"),
+});
+const reaManager = new ReaManager({
+  store: reaStore,
+  onEvent: (event) => recordEvent(event),
+});
+const allowRea = createRateLimiter(30, 60_000);
+const allowReaUpload = createRateLimiter(10, 60_000);
+// Uploads that were never used are removed from the unit after 24 h (best effort, hourly, only when REA is on).
+const reaUploadSweep = setInterval(() => {
+  if (getSettings().reaEnabled !== true) return;
+  for (const { id } of registry.sparks) {
+    const unit = registry.getSpark(id);
+    if (!unit?.online || (unit.platform && unit.platform !== "linux")) continue;
+    reaManager.sweepUploads(unit).catch(() => {});
+  }
+}, 60 * 60 * 1000);
+reaUploadSweep.unref();
+
 // ─── Monitor map ─────────────────────────────────────────
 const monitors = new Map();
 
@@ -455,12 +489,42 @@ const fleetEnergyRuntime = createFleetEnergyRuntime({
   monitors,
 });
 
+const unitHistoryRuntime = createUnitHistoryRuntime({
+  store: unitHistory,
+  orderedSnapshots,
+  monitors,
+  isEnabled: metricsHistoryEnabled,
+});
+unitHistoryRuntime.start();
+
 // Cumulative prompt/generated token totals per model (per-UTC-day buckets for range queries).
 const llmTokenRuntime = createLlmTokenRuntime({ ledger: llmTokenLedger, orderedSnapshots });
+
+// Alert notifications over the Health findings and the Overview strip's exceptions.
+// Opt-in (settings.alertsEnabled): while off nothing is evaluated or sent, and
+// the config and test routes refuse. Every send is recorded in the Activity log.
+const alertsRuntime = createAlertsRuntime({
+  filePath: ALERTS_JSON_PATH,
+  isEnabled: () => getSettings().alertsEnabled === true,
+  recordEvent,
+});
 
 // ─── Express app ─────────────────────────────────────────
 const app = express();
 const server = createServer(app);
+
+// REA uploads stream raw bytes, so they are mounted before the JSON body parser. They apply the same auth
+// middleware (host guard + token) per route; registering them without it throws at boot.
+const reaDeps = {
+  registry,
+  manager: reaManager,
+  store: reaStore,
+  allowRun: allowRea,
+  allowUpload: allowReaUpload,
+  principalKey,
+  rejectLimited,
+};
+registerReaUploadRoutes(app, { ...reaDeps, authMiddleware: createAuthMiddleware() });
 
 app.use(express.json());
 // Registered ahead of the auth middleware: a remote browser holding no token
@@ -539,6 +603,8 @@ function clientKey(req) {
 // ─── REST API ────────────────────────────────────────────
 registerFleetEnergyRoute(app, fleetEnergyTracker);
 registerLlmTokenTotalsRoute(app, llmTokenLedger);
+app.get("/api/model-prices", createModelPricesHandler());
+registerAlertRoutes(app, alertsRuntime);
 
 // Never return SSH passwords in any response
 app.get("/api/sparks", (_req, res) => {
@@ -690,8 +756,10 @@ app.delete("/api/sparks/:id", (req, res) => {
     stopMonitor(req.params.id);
     launcherManager.removeSpark(req.params.id);
     launcherStatusCache.delete(req.params.id);
-    gpuHistory.remove(req.params.id);
+    unitHistory.remove(req.params.id);
     toolEvalManager.removeSpark(req.params.id);
+    vulnHuntManager.removeSpark(req.params.id);
+    reaManager.removeSpark(req.params.id);
     recordEvent({
       type: "spark.removed",
       severity: "info",
@@ -721,7 +789,7 @@ app.put("/api/sparks/order", (req, res) => {
 
 // ─── Global settings ──────────────────────────────────────
 app.get("/api/settings", (_req, res) => {
-  res.json(getSettings());
+  res.json({ ...getSettings(), inferenceActivityEnabled: inferenceActivity.enabled });
 });
 
 app.put("/api/settings", (req, res) => {
@@ -736,17 +804,23 @@ app.put("/api/settings", (req, res) => {
       }
       restartBroadcast();
     }
-    res.json(newSettings);
+    res.json({ ...newSettings, inferenceActivityEnabled: inferenceActivity.enabled });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Recent GPU utilization / temperature / power % for one Spark (parallel arrays), newest last.
-app.get("/api/sparks/:id/gpu-history", (req, res) => {
-  if (!registry.getSpark(req.params.id)) return res.status(404).json({ error: "Spark not found" });
-  const windowMs = Math.min(8 * 3600_000, Math.max(60_000, Number(req.query.windowMs) || 8 * 3600_000));
-  res.json(gpuHistory.get(req.params.id, Date.now() - windowMs));
+// Optional gateway summaries; source URLs and labels can only be set on the server.
+app.get("/api/inference/activity", async (_req, res) => {
+  await inferenceActivity.refreshIfDue();
+  res.set("Cache-Control", "no-store").json(inferenceActivity.snapshot());
+});
+
+// GET /api/sparks/:id/gpu-history (GPU raw tier, newest last) and /api/sparks/:id/history (bucketed tiers).
+registerUnitHistoryRoutes(app, {
+  store: unitHistory,
+  hasUnit: (id) => Boolean(registry.getSpark(id)),
+  isEnabled: metricsHistoryEnabled,
 });
 
 app.get("/api/sparks/:id/metrics", (req, res) => {
@@ -796,6 +870,17 @@ registerToolEvalRoutes(app, {
   manager: toolEvalManager,
   store: toolEvalStore,
   allowRun: allowToolEval,
+  principalKey,
+  rejectLimited,
+});
+
+registerReaRoutes(app, reaDeps);
+
+registerVulnHuntRoutes(app, {
+  registry,
+  manager: vulnHuntManager,
+  store: vulnHuntStore,
+  allowRun: allowVulnHunt,
   principalKey,
   rejectLimited,
 });
@@ -1342,7 +1427,7 @@ app.get("/api/sparks/:id/llm/daily", (req, res) => {
  */
 app.post("/api/sparks/:id/llm/bench", async (req, res) => {
   if (activeBenchJobCount() >= MAX_ACTIVE_BENCH_JOBS) {
-    return res.status(429).json({ error: "Global active benchmark cap reached; wait for a job to finish" });
+    return res.status(429).json({ error: `Global active benchmark cap (${MAX_ACTIVE_BENCH_JOBS}) reached; wait for a job to finish` });
   }
   const spark = registry.getSpark(req.params.id);
   if (!spark) return res.status(404).json({ error: "Spark not found" });
@@ -1518,7 +1603,7 @@ app.delete("/api/sparks/:id/llm/bench/:benchId", (req, res) => {
  */
 app.post("/api/sparks/:id/llm/prefill-bench", async (req, res) => {
   if (activeBenchJobCount() >= MAX_ACTIVE_BENCH_JOBS) {
-    return res.status(429).json({ error: "Global active benchmark cap reached; wait for a job to finish" });
+    return res.status(429).json({ error: `Global active benchmark cap (${MAX_ACTIVE_BENCH_JOBS}) reached; wait for a job to finish` });
   }
   const spark = registry.getSpark(req.params.id);
   if (!spark) return res.status(404).json({ error: "Spark not found" });
@@ -1658,7 +1743,7 @@ app.delete("/api/sparks/:id/llm/prefill-bench/:benchId", (req, res) => {
  */
 app.post("/api/sparks/:id/llm/quality-bench", async (req, res) => {
   if (activeBenchJobCount() >= MAX_ACTIVE_BENCH_JOBS) {
-    return res.status(429).json({ error: "Global active benchmark cap reached; wait for a job to finish" });
+    return res.status(429).json({ error: `Global active benchmark cap (${MAX_ACTIVE_BENCH_JOBS}) reached; wait for a job to finish` });
   }
   const spark = registry.getSpark(req.params.id);
   if (!spark) return res.status(404).json({ error: "Spark not found" });
@@ -1740,10 +1825,21 @@ app.get("/api/sparks/:id/llm/quality-bench", (req, res) => {
       ? parseInt(String(portRaw), 10)
       : null;
   const p = Number.isInteger(port) ? port : null;
+  // `port` picks the endpoint of the current run view; `historyPort` (a port, or
+  // "all") widens or narrows the saved-run list on its own so runs from other
+  // endpoints stay reachable for comparison. Without it, history follows `port`.
+  const hpRaw = req.query.historyPort;
+  let historyPort = p;
+  if (hpRaw === "all") historyPort = null;
+  else if (hpRaw != null && hpRaw !== "") {
+    const hp = parseInt(String(hpRaw), 10);
+    if (!Number.isInteger(hp)) return res.status(400).json({ error: "historyPort must be a port number or \"all\"" });
+    historyPort = hp;
+  }
   res.json({
     active: qualityBenchManager.getActive(spark.id),
     last: qualityBenchManager.getLast(spark.id, p),
-    history: qualityBenchManager.getHistorySummaries(spark.id, p),
+    history: qualityBenchManager.getHistorySummaries(spark.id, historyPort),
     defaults: QUALITY_BENCH_DEFAULTS,
   });
 });
@@ -2096,6 +2192,18 @@ app.post("/api/sparks/:id/shutdown", async (req, res) => {
   }
 });
 
+// GPU clock cap (nvidia-smi -lgc, optionally kept across reboots by a systemd service).
+// Needs root on the unit: the local unit runs as root in the host mount namespace, a
+// remote one uses `sudo -n` as its SSH user. Same auth and limiters as power actions.
+registerGpuClockRoutes(app, {
+  manager: new GpuClockManager(),
+  registry,
+  recordEvent,
+  allowRead: (req) => allowTest(principalKey(req)),
+  allowChange: (req) => allowDestructive(principalKey(req)) && allowGlobalDestructive(clientKey(req)),
+  rejectLimited,
+});
+
 app.post("/api/sparks/:id/wake", async (req, res) => {
   try {
     const spark = registry.getSpark(req.params.id);
@@ -2218,23 +2326,25 @@ wss.on("connection", (ws) => {
 
 // ─── Broadcast snapshot (dynamic interval) ────────────────
 let broadcastTimer = null;
-let _lastBroadcastPayload = null;
 
 /** Build the snapshot payload string. Centralized so broadcast + refresh share it. */
-function buildSnapshotPayload() {
-  return JSON.stringify({
+function buildSnapshotPayload(sparks = orderedSnapshots()) {
+  const payload = {
     type: "snapshot",
     generatedAt: Date.now(),
-    sparks: orderedSnapshots(),
+    sparks,
     refreshInterval: getSettings().pollIntervalMs,
-  });
+  };
+  // Only while alerts are on: the key's absence tells the UI to derive its own.
+  const alerts = alertsRuntime.snapshotBlock();
+  if (alerts) payload.alerts = alerts;
+  return JSON.stringify(payload);
 }
 
 /**
  * Send a payload to every open WS client.
- * - Drops clients whose send queue is backlogged (>1 MB) to avoid unbounded
- *   buffering on slow/flaky connections (e.g. phone over spotty WiFi).
- * - Returns the payload so callers can compare against the previous broadcast.
+ * Drops clients whose send queue is backlogged (>1 MB) to avoid unbounded
+ * buffering on slow/flaky connections (e.g. phone over spotty WiFi).
  */
 function broadcastPayload(payload) {
   wss.clients.forEach((client) => {
@@ -2256,25 +2366,28 @@ function broadcastPayload(payload) {
 }
 
 /**
- * Force an immediate broadcast, ignoring the diff cache.
+ * Broadcast now instead of on the next tick.
  * Used after a user action (manual refresh / hermes check / update) so the
- * UI reflects the result right away instead of on the next poll tick.
+ * UI reflects the result right away.
  */
 function forceBroadcast() {
-  const payload = buildSnapshotPayload();
-  _lastBroadcastPayload = payload;
-  broadcastPayload(payload);
+  broadcastPayload(buildSnapshotPayload());
 }
 
 function startBroadcast() {
   const interval = getSettings().pollIntervalMs;
   broadcastTimer = setInterval(() => {
-    const payload = buildSnapshotPayload();
-    // Skip the broadcast entirely when nothing changed since the last tick.
-    // A 1s poll that produces identical snapshots becomes free for idle tabs.
-    if (_lastBroadcastPayload !== null && payload === _lastBroadcastPayload) return;
-    _lastBroadcastPayload = payload;
-    broadcastPayload(payload);
+    const sparks = orderedSnapshots();
+    // Alerts are evaluated once per fleet snapshot, before it goes out, so the
+    // payload carries the alerts this very snapshot produced. They run whether
+    // or not a dashboard is open.
+    alertsRuntime.tick(sparks);
+    // Nobody is listening: skip serialising every unit's snapshot. A client that
+    // connects later gets a fresh one from the connection handler.
+    if (wss.clients.size === 0) return;
+    // Send every tick even when nothing changed. The UI treats snapshot arrival
+    // as its liveness signal and shows "Telemetry is stale" without it.
+    broadcastPayload(buildSnapshotPayload(sparks));
   }, interval);
 }
 
@@ -2283,7 +2396,6 @@ function restartBroadcast() {
     clearInterval(broadcastTimer);
     broadcastTimer = null;
   }
-  _lastBroadcastPayload = null; // force a fresh broadcast on the new cadence
   startBroadcast();
 }
 
@@ -2302,6 +2414,17 @@ if (!startupPreflight.fatal) {
     learnTailscaleName();
     setInterval(learnTailscaleName, 10 * 60 * 1000).unref();
   }
+  // A failed listen (port in use, address not available) must end the process.
+  // The WebSocket server's own error handler only logs it, and the broadcast
+  // timer would keep a process alive that never serves a request.
+  server.on("error", (err) => {
+    if (server.listening) {
+      console.error("[sparkDash] server error:", err?.message);
+      return;
+    }
+    console.error(`[sparkDash] cannot listen on ${BIND_HOST}:${PORT}: ${err?.message}`);
+    process.exit(1);
+  });
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[sparkDash] server listening on http://${BIND_HOST}:${PORT}`);
     console.log(`[sparkDash] WebSocket endpoint ws://${BIND_HOST}:${PORT}/ws`);
@@ -2311,6 +2434,7 @@ if (!startupPreflight.fatal) {
       console.warn("[sparkDash] WARNING: remote bind without SPARKDASH_TOKEN is OPEN — anyone who can reach this port can change settings and power units off. Set SPARKDASH_TOKEN to require a token.");
     }
     startAllMonitors();
+    alertsRuntime.start();
     fleetEnergyRuntime.start();
     llmTokenRuntime.start();
   });
@@ -2342,6 +2466,8 @@ async function shutdown(signal) {
   try {
     launcherManager.shutdown();
     toolEvalManager.shutdown();
+    vulnHuntManager.shutdown();
+    reaManager.shutdown();
   } catch (err) {
     console.error("[sparkDash] failed to stop launcher watchers:", err.message);
   }
@@ -2351,10 +2477,9 @@ async function shutdown(signal) {
     console.error("[sparkDash] failed to flush event log:", err.message);
   }
   try {
-    clearInterval(gpuHistoryTimer);
-    gpuHistory.stop();
+    unitHistoryRuntime.stop();
   } catch (err) {
-    console.error("[sparkDash] failed to flush GPU history:", err.message);
+    console.error("[sparkDash] failed to flush unit history:", err.message);
   }
   try {
     llmDaily.flush();

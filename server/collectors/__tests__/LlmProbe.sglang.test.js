@@ -195,7 +195,7 @@ test("_detectServerType: OpenAI models + get_server_info → sglang", async () =
       return {
         ok: true,
         status: 200,
-        json: async () => ({ version: "0.5.0" }),
+        json: async () => ({ version: "0.5.0", model_path: "/models/qwen" }),
       };
     }
     return { ok: false, status: 404, json: async () => ({}) };
@@ -681,7 +681,8 @@ function sglangCounterProbe(state) {
   return probe;
 }
 
-test("probe: SGLang prefill tok/s returns to 0 once the engine goes idle (#99)", async () => {
+test("probe: SGLang prefill tok/s returns to 0 once the engine goes idle (#99)", async (t) => {
+  t.mock.method(Date, "now", () => 1_800_000_000_000);
   const state = { prompt: 1000, gen: 500, running: 0 };
   const probe = sglangCounterProbe(state);
 

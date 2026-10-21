@@ -16,6 +16,7 @@ import { ComfyPanel } from "./ComfyPanel";
 import { LlmModelsPanel } from "./LlmModelsPanel";
 import { RocePanel } from "./RocePanel";
 import { UnifiedMemoryPanel } from "./UnifiedMemoryPanel";
+import { HistoryPanel } from "./HistoryPanel";
 import "../../styles/spark.css";
 import { vramContextFor } from "../../shared/vramBreakdown";
 
@@ -28,7 +29,11 @@ interface SparkPageProps {
   benchShareImage?: boolean;
   /** GPU panel VRAM bar split by engine / system / free (Settings, on by default). */
   showVramBreakdown?: boolean;
+  /** 48 h / 30 d History panel under the columns (Settings → Metrics history, off by default). */
+  metricsHistory?: boolean;
   onEdit?: () => void;
+  /** Navigate to a spark id (header back-to-overview link). */
+  onNavigate?: (sparkId: string) => void;
 }
 
 type SparkView = "all" | "resources" | "services";
@@ -48,7 +53,9 @@ export function SparkPage({
   temperatureUnit,
   benchShareImage = false,
   showVramBreakdown = true,
+  metricsHistory = false,
   onEdit,
+  onNavigate,
 }: SparkPageProps) {
   const { metrics } = spark;
   const [disabledDevices, setDisabledDevices] = useState<string[]>(spark.disabledDevices || []);
@@ -97,23 +104,26 @@ export function SparkPage({
     [spark.id]
   );
 
-  const handleAddPort = useCallback(async () => {
-    const port = parseInt(newPortDraft, 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return;
-    if (llmPorts.includes(port)) {
-      setNewPortDraft("");
-      setShowAddPort(false);
-      return;
-    }
-    try {
-      const result = await addLlmPort(spark.id, port);
-      setLlmPorts(result.llmPorts);
-      setNewPortDraft("");
-      setShowAddPort(false);
-    } catch (err) {
-      console.error("Failed to add LLM port:", err);
-    }
-  }, [spark.id, newPortDraft, llmPorts]);
+  const handleAddPort = useCallback(
+    async (portOverride?: number) => {
+      const port = portOverride ?? parseInt(newPortDraft, 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+      if (llmPorts.includes(port)) {
+        setNewPortDraft("");
+        setShowAddPort(false);
+        return;
+      }
+      try {
+        const result = await addLlmPort(spark.id, port);
+        setLlmPorts(result.llmPorts);
+        setNewPortDraft("");
+        setShowAddPort(false);
+      } catch (err) {
+        console.error("Failed to add LLM port:", err);
+      }
+    },
+    [spark.id, newPortDraft, llmPorts]
+  );
 
   const handleRemovePort = useCallback(async (port: number) => {
     try {
@@ -140,7 +150,12 @@ export function SparkPage({
   const showUnified = spark.kind !== "host" && unified != null && unified.total > 0;
 
   const renderLlmPanel = (port: number, portIndex: number, className?: string) => {
-    const llmMetrics = metrics.llm?.[portIndex] ?? null;
+    // Match by the snapshot's own port so a panel never shows another port's
+    // backend (stale-array window after adding/switching ports); fall back to
+    // position for servers that don't yet report `port`.
+    const llmMetrics =
+      metrics.llm?.find((l) => l?.port != null && l.port === port) ??
+      (metrics.llm?.[portIndex]?.port == null ? (metrics.llm?.[portIndex] ?? null) : null);
     const canRemove = portIndex > 0;
     return (
       <LlmPanel
@@ -196,6 +211,33 @@ export function SparkPage({
         >
           Cancel
         </button>
+        <div className="sp-add-port__presets" role="group" aria-label="Server presets">
+          <span className="sp-hint">Presets:</span>
+          <button
+            type="button"
+            title="LM Studio default port"
+            onClick={() => void handleAddPort(1234)}
+            className="btn btn--sm"
+          >
+            LM Studio :1234
+          </button>
+          <button
+            type="button"
+            title="Ollama default port"
+            onClick={() => void handleAddPort(11434)}
+            className="btn btn--sm"
+          >
+            Ollama :11434
+          </button>
+          <button
+            type="button"
+            title="TensorFold default port"
+            onClick={() => void handleAddPort(8888)}
+            className="btn btn--sm"
+          >
+            TensorFold :8888
+          </button>
+        </div>
       </div>
     ) : (
       <button type="button" onClick={() => setShowAddPort(true)} className="sp-add-port-btn">
@@ -215,7 +257,7 @@ export function SparkPage({
 
   return (
     <div className="sp">
-      <SparkHeader spark={spark} onEdit={onEdit} />
+      <SparkHeader spark={spark} onEdit={onEdit} onNavigate={onNavigate} />
       {/* Mobile-only action row (Update Hermes / Edit / Power) — desktop keeps them in the header. */}
       <SparkActions spark={spark} onEdit={onEdit} className="sp-mobile-actions flex sm:hidden" />
       {spark.online ? <HealthList findings={spark.health} /> : null}
@@ -296,6 +338,11 @@ export function SparkPage({
             )}
           </div>
         </div>
+      )}
+
+      {/* Full width under both columns: the small multiples need the room. */}
+      {metricsHistory && (
+        <HistoryPanel key={spark.id} sparkId={spark.id} kind={spark.kind} temperatureUnit={temperatureUnit} />
       )}
     </div>
   );
